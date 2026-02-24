@@ -1,0 +1,13 @@
+# Données générées
+data/
+
+# Secrets
+.env
+
+# Environnement Python
+.venv/
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
