@@ -17,7 +17,7 @@ Conçu pour être exécuté par un **CronJob Kubernetes** (ex : toutes les 30 se
 gtfsrt:trip_updates   →  JSON  { "<trip_id>": { "vehicle": "422", "delays": { "<stop_id>": <delay_sec> } } }
 ```
 
-TTL : **45 secondes** (à ajuster selon la périodicité du CronJob).
+TTL : **90 secondes** (spec GTFS-RT, CronJob Kubernetes `*/1 * * * *`).
 
 ## Lancement local
 

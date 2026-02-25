@@ -4,6 +4,11 @@ import os
 import urllib.request
 
 import redis
+try:
+    import psycopg
+    HAS_PSYCOPG = True
+except Exception:
+    HAS_PSYCOPG = False
 from dotenv import load_dotenv
 from google.transit import gtfs_realtime_pb2
 
@@ -18,11 +23,12 @@ log = logging.getLogger(__name__)
 
 GTFSRT_URL = os.getenv("GTFSRT_URL")
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
+TRIPS_DATABASE_URL = os.getenv("TRIPS_DATABASE_URL")
 
 # Clé Redis où le JSON des trip updates est stocké
 REDIS_KEY_PREFIX = "trip:"
-# TTL : légèrement supérieur à la périodicité du CronJob (ex: 45s pour un job toutes les 30s)
-REDIS_TTL_S = 45
+# TTL recommandé par la spec GTFS-RT : 90s (job toutes les 60s)
+REDIS_TTL_S = 90
 
 
 def fetch_and_push():
@@ -55,7 +61,9 @@ def fetch_and_push():
             skipped += 1
             continue
 
+        # Récupère l'ID du véhicule et l'ID de la ligne (route_id) si présents
         vehicle_id = tu.vehicle.id if tu.vehicle.id else None
+        route_id = tu.trip.route_id if tu.trip.route_id else None
 
         delays = {}
         for stu in tu.stop_time_update:
@@ -73,18 +81,69 @@ def fetch_and_push():
 
         trip_updates[trip_id] = {
             "vehicle": vehicle_id,
+            "route": route_id,
             "delays": delays,
         }
 
     log.info(f"TripUpdates valides : {len(trip_updates)} | Ignorées : {skipped}")
 
     r = redis.from_url(REDIS_URL)
+
+    # TTL cache pour trip->line : 5 minutes
+    CACHE_TTL_LINE_S = 300
+
+    # 1) Résolution trip->line manquants : d'abord cache Redis
+    missing = [tid for tid, d in trip_updates.items() if not d.get('route')]
+    if missing:
+        cache_keys = [f"trip_line:{tid}" for tid in missing]
+        cached_vals = r.mget(cache_keys)
+
+        to_lookup = []
+        for tid, val in zip(missing, cached_vals):
+            if val:
+                try:
+                    line = val.decode() if isinstance(val, bytes) else str(val)
+                except Exception:
+                    line = str(val)
+                trip_updates[tid]['route'] = line
+            else:
+                to_lookup.append(tid)
+
+        # 2) Si encore manquants, interroger Postgres (si configuré et driver dispo)
+        if to_lookup and TRIPS_DATABASE_URL and HAS_PSYCOPG:
+            try:
+                with psycopg.connect(TRIPS_DATABASE_URL) as conn:
+                    # Paramètre : liste/array
+                    rows = conn.execute("SELECT trip_id, route_id FROM trips WHERE trip_id = ANY(%s)", (to_lookup,)).fetchall()
+                    for trip_id, route_id in rows:
+                        if route_id:
+                            trip_updates[trip_id]['route'] = route_id
+                            # cache
+                            r.set(f"trip_line:{trip_id}", route_id, ex=CACHE_TTL_LINE_S)
+            except Exception as e:
+                log.error(f"Erreur lors du lookup Postgres trip->route: {e}")
+
+    # 3) Publier TripUpdates et construire mapping route->vehicles
     pipe = r.pipeline()
     for trip_id, data in trip_updates.items():
-        pipe.set(f"{REDIS_KEY_PREFIX}{trip_id}", json.dumps(data, separators=(',', ':')), ex=REDIS_TTL_S)
+        pipe.set(f"{REDIS_KEY_PREFIX}{trip_id}", json.dumps(data, separators=(',', ':'), ensure_ascii=False), ex=REDIS_TTL_S)
+
+    route_map = {}
+    for data in trip_updates.values():
+        route = data.get('route')
+        vehicle = data.get('vehicle')
+        if route and vehicle:
+            route_map.setdefault(route, set()).add(vehicle)
+
+    # Publier attributions:<route> -> JSON array of vehicle ids (TTL 5min)
+    for route, vehicles in route_map.items():
+        vehicles_list = sorted(list(vehicles))
+        pipe.set(f"attributions:{route}", json.dumps(vehicles_list, separators=(',', ':'), ensure_ascii=False), ex=CACHE_TTL_LINE_S)
+
     pipe.execute()
 
     log.info(f"✅ {len(trip_updates)} clés publiées dans Redis (préfixe '{REDIS_KEY_PREFIX}', TTL {REDIS_TTL_S}s)")
+    log.info(f"✅ {len(route_map)} attributions publiées (préfixe 'attributions:')")
 
 
 if __name__ == "__main__":
