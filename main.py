@@ -4,7 +4,6 @@ import os
 import time
 import urllib.request
 
-from google.protobuf import json_format
 import psycopg
 import redis
 from dotenv import load_dotenv
@@ -22,7 +21,6 @@ log = logging.getLogger(__name__)
 GTFSRT_URL = os.getenv("GTFSRT_URL")
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 TRIPS_DATABASE_URL = os.getenv("TRIPS_DATABASE_URL")
-GTFSRT_DUMP_PATH = os.getenv("GTFSRT_DUMP_PATH", "gtfsrt_dump.json")
 
 # Clé Redis où le JSON des trip updates est stocké
 REDIS_KEY_PREFIX = "trip:"
@@ -45,12 +43,6 @@ def fetch_and_push():
     feed.ParseFromString(raw)
 
     log.info(f"Timestamp flux : {feed.header.timestamp} | Entités : {len(feed.entity)}")
-
-    # Export brut du flux GTFS-RT en JSON
-    feed_dict = json_format.MessageToDict(feed, preserving_proto_field_name=True)
-    with open(GTFSRT_DUMP_PATH, "w", encoding="utf-8") as f:
-        json.dump(feed_dict, f, indent=2, ensure_ascii=False)
-    log.info(f"Flux exporté en JSON → {GTFSRT_DUMP_PATH}")
 
     trip_updates = {}
     skipped = 0
