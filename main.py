@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import time
 import urllib.request
 
 import redis
@@ -147,4 +148,10 @@ def fetch_and_push():
 
 
 if __name__ == "__main__":
-    fetch_and_push()
+    while True:
+        try:
+            fetch_and_push()
+        except Exception as e:
+            log.error(f"Erreur lors de l'exécution : {e}")
+        
+        time.sleep(59)
