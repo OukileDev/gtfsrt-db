@@ -48,6 +48,16 @@ def fetch_and_push():
 
     log.info(f"Timestamp flux : {feed.header.timestamp} | Entités : {len(feed.entity)}")
 
+    # Build trip_id -> vehicle_id mapping from VehiclePosition entities
+    vehicle_by_trip = {}
+    for entity in feed.entity:
+        if entity.HasField("vehicle"):
+            vp = entity.vehicle
+            tid = vp.trip.trip_id
+            vid = vp.vehicle.id
+            if tid and vid:
+                vehicle_by_trip[tid] = vid
+
     trip_updates = {}
     skipped = 0
 
