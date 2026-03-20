@@ -4,12 +4,9 @@ import os
 import time
 import urllib.request
 
+from google.protobuf import json_format
+import psycopg
 import redis
-try:
-    import psycopg
-    HAS_PSYCOPG = True
-except Exception:
-    HAS_PSYCOPG = False
 from dotenv import load_dotenv
 from google.transit import gtfs_realtime_pb2
 
@@ -25,6 +22,7 @@ log = logging.getLogger(__name__)
 GTFSRT_URL = os.getenv("GTFSRT_URL")
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 TRIPS_DATABASE_URL = os.getenv("TRIPS_DATABASE_URL")
+GTFSRT_DUMP_PATH = os.getenv("GTFSRT_DUMP_PATH", "gtfsrt_dump.json")
 
 # Clé Redis où le JSON des trip updates est stocké
 REDIS_KEY_PREFIX = "trip:"
@@ -48,15 +46,11 @@ def fetch_and_push():
 
     log.info(f"Timestamp flux : {feed.header.timestamp} | Entités : {len(feed.entity)}")
 
-    # Build trip_id -> vehicle_id mapping from VehiclePosition entities
-    vehicle_by_trip = {}
-    for entity in feed.entity:
-        if entity.HasField("vehicle"):
-            vp = entity.vehicle
-            tid = vp.trip.trip_id
-            vid = vp.vehicle.id
-            if tid and vid:
-                vehicle_by_trip[tid] = vid
+    # Export brut du flux GTFS-RT en JSON
+    feed_dict = json_format.MessageToDict(feed, preserving_proto_field_name=True)
+    with open(GTFSRT_DUMP_PATH, "w", encoding="utf-8") as f:
+        json.dump(feed_dict, f, indent=2, ensure_ascii=False)
+    log.info(f"Flux exporté en JSON → {GTFSRT_DUMP_PATH}")
 
     trip_updates = {}
     skipped = 0
@@ -72,9 +66,8 @@ def fetch_and_push():
             skipped += 1
             continue
 
-        # Récupère l'ID du véhicule : d'abord dans trip_update, sinon depuis VehiclePosition
-        vehicle_id = tu.vehicle.id if tu.vehicle.id else vehicle_by_trip.get(trip_id)
-        route_id = tu.trip.route_id if tu.trip.route_id else None
+        vehicle_id = tu.vehicle.id or None
+        route_id = None
 
         delays = {}
         for stu in tu.stop_time_update:
@@ -122,7 +115,7 @@ def fetch_and_push():
 
         log.info(f"Résolution routes : {len(missing)} manquants → {len(missing)-len(to_lookup)} depuis cache Redis, {len(to_lookup)} à chercher en DB")
         # 2) Si encore manquants, interroger Postgres (si configuré et driver dispo)
-        if to_lookup and TRIPS_DATABASE_URL and HAS_PSYCOPG:
+        if to_lookup and TRIPS_DATABASE_URL:
             try:
                 with psycopg.connect(TRIPS_DATABASE_URL) as conn:
                     # Paramètre : liste/array
