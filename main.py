@@ -62,8 +62,8 @@ def fetch_and_push():
             skipped += 1
             continue
 
-        # Récupère l'ID du véhicule et l'ID de la ligne (route_id) si présents
-        vehicle_id = tu.vehicle.id if tu.vehicle.id else None
+        # Récupère l'ID du véhicule : d'abord dans trip_update, sinon depuis VehiclePosition
+        vehicle_id = tu.vehicle.id if tu.vehicle.id else vehicle_by_trip.get(trip_id)
         route_id = tu.trip.route_id if tu.trip.route_id else None
 
         delays = {}
@@ -110,6 +110,7 @@ def fetch_and_push():
             else:
                 to_lookup.append(tid)
 
+        log.info(f"Résolution routes : {len(missing)} manquants → {len(missing)-len(to_lookup)} depuis cache Redis, {len(to_lookup)} à chercher en DB")
         # 2) Si encore manquants, interroger Postgres (si configuré et driver dispo)
         if to_lookup and TRIPS_DATABASE_URL and HAS_PSYCOPG:
             try:
