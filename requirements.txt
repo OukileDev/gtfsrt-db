@@ -1,4 +1,4 @@
 gtfs-realtime-bindings
 redis
 python-dotenv
-psycopg
+psycopg[binary]
