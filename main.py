@@ -3,6 +3,7 @@ import logging
 import os
 import time
 import urllib.request
+from datetime import datetime, timedelta
 
 import psycopg
 import redis
@@ -26,6 +27,18 @@ TRIPS_DATABASE_URL = os.getenv("TRIPS_DATABASE_URL")
 REDIS_KEY_PREFIX = "trip:"
 # TTL recommandé par la spec GTFS-RT : 90s (job toutes les 60s)
 REDIS_TTL_S = 90
+
+
+def parse_start_datetime(start_date: str | None, start_time: str | None) -> datetime | None:
+    """Convertit start_date (YYYYMMDD) + start_time (HH:MM:SS, peut dépasser 24h) en datetime."""
+    if not start_date or not start_time:
+        return None
+    try:
+        base = datetime.strptime(start_date, "%Y%m%d")
+        h, m, s = (int(x) for x in start_time.split(":"))
+        return base + timedelta(hours=h, minutes=m, seconds=s)
+    except Exception:
+        return None
 
 
 def fetch_and_push():
@@ -60,6 +73,8 @@ def fetch_and_push():
 
         vehicle_id = tu.vehicle.id or None
         route_id = None
+        start_time = tu.trip.start_time or None   # "HH:MM:SS"
+        start_date = tu.trip.start_date or None   # "YYYYMMDD"
 
         delays = {}
         for stu in tu.stop_time_update:
@@ -78,6 +93,9 @@ def fetch_and_push():
         trip_updates[trip_id] = {
             "vehicle": vehicle_id,
             "route": route_id,
+            "headsign": None,
+            "start_time": start_time,
+            "start_date": start_date,
             "delays": delays,
         }
 
@@ -98,10 +116,14 @@ def fetch_and_push():
         for tid, val in zip(missing, cached_vals):
             if val:
                 try:
-                    line = val.decode() if isinstance(val, bytes) else str(val)
+                    decoded = val.decode() if isinstance(val, bytes) else str(val)
+                    cached = json.loads(decoded)
+                    trip_updates[tid]['route'] = cached.get('route')
+                    trip_updates[tid]['headsign'] = cached.get('headsign')
                 except Exception:
-                    line = str(val)
-                trip_updates[tid]['route'] = line
+                    # ancienne entrée cache plain string (route_id seulement)
+                    trip_updates[tid]['route'] = decoded
+                    to_lookup.append(tid)
             else:
                 to_lookup.append(tid)
 
@@ -110,37 +132,90 @@ def fetch_and_push():
         if to_lookup and TRIPS_DATABASE_URL:
             try:
                 with psycopg.connect(TRIPS_DATABASE_URL) as conn:
-                    # Paramètre : liste/array
-                    rows = conn.execute("SELECT trip_id, route_id FROM trips WHERE trip_id = ANY(%s)", (to_lookup,)).fetchall()
-                    for trip_id, route_id in rows:
+                    rows = conn.execute(
+                        "SELECT trip_id, route_id, trip_headsign FROM trips WHERE trip_id = ANY(%s)",
+                        (to_lookup,)
+                    ).fetchall()
+                    for trip_id, route_id, trip_headsign in rows:
                         if route_id:
                             trip_updates[trip_id]['route'] = route_id
-                            # cache
-                            r.set(f"trip_line:{trip_id}", route_id, ex=CACHE_TTL_LINE_S)
+                            trip_updates[trip_id]['headsign'] = trip_headsign or None
+                            r.set(f"trip_line:{trip_id}", json.dumps({"route": route_id, "headsign": trip_headsign}, separators=(',', ':')), ex=CACHE_TTL_LINE_S)
             except Exception as e:
                 log.error(f"Erreur lors du lookup Postgres trip->route: {e}")
 
-    # 3) Publier TripUpdates et construire mapping route->vehicles
+    # 3) Publier TripUpdates et construire mappings route->vehicles et vehicle->info
     pipe = r.pipeline()
     for trip_id, data in trip_updates.items():
         pipe.set(f"{REDIS_KEY_PREFIX}{trip_id}", json.dumps(data, separators=(',', ':'), ensure_ascii=False), ex=REDIS_TTL_S)
 
     route_map = {}
-    for data in trip_updates.values():
+    # vehicle_best : pour chaque véhicule, on garde le trip dont le start_time
+    # est le plus récent parmi ceux déjà démarrés (ou le plus proche dans le futur
+    # si tous les trips sont encore à venir).
+    now = datetime.now()
+    vehicle_best: dict[str, tuple[datetime | None, dict]] = {}
+    for tid, data in trip_updates.items():
         route = data.get('route')
         vehicle = data.get('vehicle')
-        if route and vehicle:
-            route_map.setdefault(route, set()).add(vehicle)
+        headsign = data.get('headsign')
+        if not (route and vehicle):
+            continue
+        route_map.setdefault(route, set()).add(vehicle)
+        # Retard au prochain arrêt : premier élément du dict delays (insertion-order)
+        next_delay = next(iter(data.get('delays', {}).values()), None)
+        info = {"route": route, "headsign": headsign, "delay": next_delay, "trip_id": tid}
+        start_dt = parse_start_datetime(data.get('start_date'), data.get('start_time'))
+        if vehicle not in vehicle_best:
+            vehicle_best[vehicle] = (start_dt, info)
+        else:
+            prev_dt, _ = vehicle_best[vehicle]
+            if start_dt is None:
+                pass  # pas de start_time : on garde l'existant
+            elif prev_dt is None:
+                vehicle_best[vehicle] = (start_dt, info)
+            else:
+                prev_past = prev_dt <= now
+                curr_past = start_dt <= now
+                if prev_past and curr_past:
+                    # Les deux déjà démarrés : prendre le plus récent
+                    if start_dt > prev_dt:
+                        vehicle_best[vehicle] = (start_dt, info)
+                elif curr_past and not prev_past:
+                    # Nouveau déjà démarré, ancien dans le futur : prendre le nouveau
+                    vehicle_best[vehicle] = (start_dt, info)
+                elif not prev_past and not curr_past:
+                    # Les deux dans le futur : prendre le plus proche
+                    if start_dt < prev_dt:
+                        vehicle_best[vehicle] = (start_dt, info)
+                # else : ancien déjà démarré, nouveau dans le futur → garder l'ancien
+    vehicle_info = {v: info for v, (_, info) in vehicle_best.items()}
 
-    # Publier attributions:<route> -> JSON array of vehicle ids (TTL 5min)
+    # Publier attributions:<route> -> JSON array of vehicle ids (tous sens, TTL 5min)
     for route, vehicles in route_map.items():
         vehicles_list = sorted(list(vehicles))
         pipe.set(f"attributions:{route}", json.dumps(vehicles_list, separators=(',', ':'), ensure_ascii=False), ex=CACHE_TTL_LINE_S)
 
+    # Publier attributions:<route>:<headsign> depuis vehicle_info (headsign correct par véhicule)
+    route_headsign_map: dict[tuple[str, str], set[str]] = {}
+    for vehicle, info in vehicle_info.items():
+        route = info['route']
+        headsign = info['headsign']
+        if headsign:
+            route_headsign_map.setdefault((route, headsign), set()).add(vehicle)
+
+    for (route, headsign), vehicles in route_headsign_map.items():
+        vehicles_list = sorted(list(vehicles))
+        pipe.set(f"attributions:{route}:{headsign}", json.dumps(vehicles_list, separators=(',', ':'), ensure_ascii=False), ex=CACHE_TTL_LINE_S)
+
+    # Publier vehicle:<vehicle_id> -> {route, headsign, delay, trip_id} (TTL 90s)
+    for vehicle, info in vehicle_info.items():
+        pipe.set(f"vehicle:{vehicle}", json.dumps(info, separators=(',', ':'), ensure_ascii=False), ex=REDIS_TTL_S)
+
     pipe.execute()
 
     log.info(f"✅ {len(trip_updates)} clés publiées dans Redis (préfixe '{REDIS_KEY_PREFIX}', TTL {REDIS_TTL_S}s)")
-    log.info(f"✅ {len(route_map)} attributions publiées (préfixe 'attributions:')")
+    log.info(f"✅ {len(route_map)} attributions par ligne | {len(route_headsign_map)} par direction | {len(vehicle_info)} vehicle:")
 
 
 if __name__ == "__main__":
