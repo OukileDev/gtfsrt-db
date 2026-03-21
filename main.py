@@ -24,7 +24,7 @@ REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 TRIPS_DATABASE_URL = os.getenv("TRIPS_DATABASE_URL")
 
 # Clé Redis où le JSON des trip updates est stocké
-REDIS_KEY_PREFIX = "trip:"
+REDIS_KEY_PREFIX = "gtfsrt:trip:"
 # TTL recommandé par la spec GTFS-RT : 90s (job toutes les 60s)
 REDIS_TTL_S = 90
 
@@ -109,7 +109,7 @@ def fetch_and_push():
     # 1) Résolution trip->line manquants : d'abord cache Redis
     missing = [tid for tid, d in trip_updates.items() if not d.get('route')]
     if missing:
-        cache_keys = [f"trip_line:{tid}" for tid in missing]
+        cache_keys = [f"gtfsrt:trip_line:{tid}" for tid in missing]
         cached_vals = r.mget(cache_keys)
 
         to_lookup = []
@@ -140,14 +140,30 @@ def fetch_and_push():
                         if route_id:
                             trip_updates[trip_id]['route'] = route_id
                             trip_updates[trip_id]['headsign'] = trip_headsign or None
-                            r.set(f"trip_line:{trip_id}", json.dumps({"route": route_id, "headsign": trip_headsign}, separators=(',', ':')), ex=CACHE_TTL_LINE_S)
+                            r.set(f"gtfsrt:trip_line:{trip_id}", json.dumps({"route": route_id, "headsign": trip_headsign}, separators=(',', ':')), ex=CACHE_TTL_LINE_S)
             except Exception as e:
                 log.error(f"Erreur lors du lookup Postgres trip->route: {e}")
 
     # 3) Publier TripUpdates et construire mappings route->vehicles et vehicle->info
     pipe = r.pipeline()
+    stop_index: dict[str, list[dict]] = {}
     for trip_id, data in trip_updates.items():
         pipe.set(f"{REDIS_KEY_PREFIX}{trip_id}", json.dumps(data, separators=(',', ':'), ensure_ascii=False), ex=REDIS_TTL_S)
+        route = data.get('route')
+        vehicle = data.get('vehicle')
+        if route and vehicle:
+            for stop_id, delay in data.get('delays', {}).items():
+                stop_index.setdefault(stop_id, []).append({
+                    "vehicle": vehicle,
+                    "route": route,
+                    "headsign": data.get('headsign'),
+                    "delay": delay,
+                })
+
+    for stop_id, entries in stop_index.items():
+        pipe.set(f"gtfsrt:stop:{stop_id}", json.dumps(entries, separators=(',', ':'), ensure_ascii=False), ex=REDIS_TTL_S)
+
+    log.info(f"Index arrêts : {len(stop_index)} clés gtfsrt:stop:* générées")
 
     route_map = {}
     # vehicle_best : pour chaque véhicule, on garde le trip dont le start_time
@@ -194,7 +210,7 @@ def fetch_and_push():
     # Publier attributions:<route> -> JSON array of vehicle ids (tous sens, TTL 5min)
     for route, vehicles in route_map.items():
         vehicles_list = sorted(list(vehicles))
-        pipe.set(f"attributions:{route}", json.dumps(vehicles_list, separators=(',', ':'), ensure_ascii=False), ex=CACHE_TTL_LINE_S)
+        pipe.set(f"gtfsrt:attributions:{route}", json.dumps(vehicles_list, separators=(',', ':'), ensure_ascii=False), ex=CACHE_TTL_LINE_S)
 
     # Publier attributions:<route>:<headsign> depuis vehicle_info (headsign correct par véhicule)
     route_headsign_map: dict[tuple[str, str], set[str]] = {}
@@ -206,16 +222,16 @@ def fetch_and_push():
 
     for (route, headsign), vehicles in route_headsign_map.items():
         vehicles_list = sorted(list(vehicles))
-        pipe.set(f"attributions:{route}:{headsign}", json.dumps(vehicles_list, separators=(',', ':'), ensure_ascii=False), ex=CACHE_TTL_LINE_S)
+        pipe.set(f"gtfsrt:attributions:{route}:{headsign}", json.dumps(vehicles_list, separators=(',', ':'), ensure_ascii=False), ex=CACHE_TTL_LINE_S)
 
     # Publier vehicle:<vehicle_id> -> {route, headsign, delay, trip_id} (TTL 90s)
     for vehicle, info in vehicle_info.items():
-        pipe.set(f"vehicle:{vehicle}", json.dumps(info, separators=(',', ':'), ensure_ascii=False), ex=REDIS_TTL_S)
+        pipe.set(f"gtfsrt:vehicle:{vehicle}", json.dumps(info, separators=(',', ':'), ensure_ascii=False), ex=REDIS_TTL_S)
 
     pipe.execute()
 
     log.info(f"✅ {len(trip_updates)} clés publiées dans Redis (préfixe '{REDIS_KEY_PREFIX}', TTL {REDIS_TTL_S}s)")
-    log.info(f"✅ {len(route_map)} attributions par ligne | {len(route_headsign_map)} par direction | {len(vehicle_info)} vehicle:")
+    log.info(f"✅ {len(route_map)} gtfsrt:attributions par ligne | {len(route_headsign_map)} par direction | {len(vehicle_info)} gtfsrt:vehicle:")
 
 
 if __name__ == "__main__":
