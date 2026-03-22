@@ -144,32 +144,11 @@ def fetch_and_push():
             except Exception as e:
                 log.error(f"Erreur lors du lookup Postgres trip->route: {e}")
 
-    # 3) Publier TripUpdates et construire mappings route->vehicles et vehicle->info
-    pipe = r.pipeline()
-    stop_index: dict[str, list[dict]] = {}
-    for trip_id, data in trip_updates.items():
-        pipe.set(f"{REDIS_KEY_PREFIX}{trip_id}", json.dumps(data, separators=(',', ':'), ensure_ascii=False), ex=REDIS_TTL_S)
-        route = data.get('route')
-        vehicle = data.get('vehicle')
-        if route and vehicle:
-            for stop_id, delay in data.get('delays', {}).items():
-                stop_index.setdefault(stop_id, []).append({
-                    "vehicle": vehicle,
-                    "route": route,
-                    "headsign": data.get('headsign'),
-                    "delay": delay,
-                })
-
-    for stop_id, entries in stop_index.items():
-        pipe.set(f"gtfsrt:stop:{stop_id}", json.dumps(entries, separators=(',', ':'), ensure_ascii=False), ex=REDIS_TTL_S)
-
-    log.info(f"Index arrêts : {len(stop_index)} clés gtfsrt:stop:* générées")
-
-    route_map = {}
-    # vehicle_best : pour chaque véhicule, on garde le trip dont le start_time
-    # est le plus récent parmi ceux déjà démarrés (ou le plus proche dans le futur
-    # si tous les trips sont encore à venir).
+    # 3) Calculer vehicle_best d'abord pour identifier le trip actif de chaque véhicule.
+    #    Un véhicule planifié sur N voyages futurs ne doit exposer son ID que sur le
+    #    voyage le plus proche ; les suivants reçoivent vehicle=null dans stop_index.
     now = datetime.now()
+    route_map = {}
     vehicle_best: dict[str, tuple[datetime | None, dict]] = {}
     for tid, data in trip_updates.items():
         route = data.get('route')
@@ -205,7 +184,33 @@ def fetch_and_push():
                     if start_dt < prev_dt:
                         vehicle_best[vehicle] = (start_dt, info)
                 # else : ancien déjà démarré, nouveau dans le futur → garder l'ancien
+
     vehicle_info = {v: info for v, (_, info) in vehicle_best.items()}
+    # Seul le trip actif d'un véhicule expose son ID dans le stop_index
+    active_trip_ids = {info['trip_id'] for info in vehicle_info.values()}
+
+    # 4) Publier TripUpdates et construire stop_index
+    pipe = r.pipeline()
+    stop_index: dict[str, list[dict]] = {}
+    for trip_id, data in trip_updates.items():
+        pipe.set(f"{REDIS_KEY_PREFIX}{trip_id}", json.dumps(data, separators=(',', ':'), ensure_ascii=False), ex=REDIS_TTL_S)
+        route = data.get('route')
+        vehicle = data.get('vehicle')
+        if route:
+            for stop_id, delay in data.get('delays', {}).items():
+                stop_index.setdefault(stop_id, []).append({
+                    "trip_id": trip_id,
+                    # vehicle_id uniquement pour le trip actif ; null sinon (mais le retard reste dispo)
+                    "vehicle": vehicle if (vehicle and trip_id in active_trip_ids) else None,
+                    "route": route,
+                    "headsign": data.get('headsign'),
+                    "delay": delay,
+                })
+
+    for stop_id, entries in stop_index.items():
+        pipe.set(f"gtfsrt:stop:{stop_id}", json.dumps(entries, separators=(',', ':'), ensure_ascii=False), ex=REDIS_TTL_S)
+
+    log.info(f"Index arrêts : {len(stop_index)} clés gtfsrt:stop:* générées")
 
     # Publier attributions:<route> -> JSON array of vehicle ids (tous sens, TTL 5min)
     for route, vehicles in route_map.items():
